@@ -147,6 +147,76 @@ class EncoderLayer(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
+# 代码接上一节，需导入之前定义的 MultiHeadAttention, FeedForward, LayerNorm
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.norm1 = LayerNorm(d_model)
+        # Encoder 的自注意力不需要掩码，is_causal=False
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout, is_causal=False)
+        self.norm2 = LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_ff, dropout)
+
+    def forward(self, x):
+        # 子层1: Self-Attention
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
+        # 子层2: Feed Forward
+        x = x + self.ff(self.norm2(x))
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, n_heads, d_ff, dropout) 
+            for _ in range(n_layers)
+        ])
+        self.norm = LayerNorm(d_model) # 最终层归一化
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+    
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.norm1 = LayerNorm(d_model)
+        # 第一个注意力层：带掩码的自注意力
+        self.masked_attn = MultiHeadAttention(d_model, n_heads, dropout, is_causal=True)
+        
+        self.norm2 = LayerNorm(d_model)
+        # 第二个注意力层：交叉注意力 (Q来自Decoder, K,V来自Encoder)
+        self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout, is_causal=False)
+        
+        self.norm3 = LayerNorm(d_model)
+        self.ff = FeedForward(d_model, d_ff, dropout)
+
+    def forward(self, x, enc_out):
+        # 子层1: 掩码自注意力
+        x = x + self.masked_attn(self.norm1(x), self.norm1(x), self.norm1(x))
+        
+        # 子层2: 交叉注意力 (注意参数传递)
+        x = x + self.cross_attn(self.norm2(x), enc_out, enc_out)
+        
+        # 子层3: 前馈网络
+        x = x + self.ff(self.norm3(x))
+        return x
+
+class Decoder(nn.Module):
+    def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, n_heads, d_ff, dropout) 
+            for _ in range(n_layers)
+        ])
+        self.norm = LayerNorm(d_model)
+
+    def forward(self, x, enc_out):
+        for layer in self.layers:
+            x = layer(x, enc_out)
+        return self.norm(x)
 
 # ------------------- 简单测试 -------------------
 if __name__ == "__main__":
@@ -182,3 +252,31 @@ if __name__ == "__main__":
     print(f"EncoderLayer 输出形状: {out_enc_layer.shape}") # 预期: [2, 10, 512]
     
     print("\n所有测试通过！")
+
+    print("\n===== 测试 Encoder 和 Decoder =====")
+    # 超参数
+    batch_size = 2
+    seq_len_src = 10 # 源序列长度
+    seq_len_tgt = 8  # 目标序列长度
+    d_model = 512
+    n_heads = 8
+    n_layers = 3
+    d_ff = 2048
+
+    # 模拟输入
+    src = torch.randn(batch_size, seq_len_src, d_model)
+    tgt = torch.randn(batch_size, seq_len_tgt, d_model)
+
+    # 实例化 Encoder 和 Decoder
+    encoder = Encoder(n_layers, d_model, n_heads, d_ff)
+    decoder = Decoder(n_layers, d_model, n_heads, d_ff)
+
+    # 前向传播
+    enc_output = encoder(src)
+    dec_output = decoder(tgt, enc_output)
+
+    print(f"Encoder 输入形状: {src.shape}")
+    print(f"Encoder 输出形状: {enc_output.shape}") # 预期: [2, 10, 512]
+    print(f"Decoder 输入形状: {tgt.shape}")
+    print(f"Decoder 输出形状: {dec_output.shape}") # 预期: [2, 8, 512]
+    print("\nEncoder-Decoder 结构测试通过！")
