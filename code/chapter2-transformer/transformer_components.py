@@ -2,6 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from dataclasses import dataclass
+
+# ------------------- 0. 配置类 -------------------
+@dataclass
+class ModelArgs:
+    """用于管理模型超参数的配置类"""
+    vocab_size: int = 10000      # 词表大小
+    block_size: int = 512        # 最大序列长度 (max_seq_len)
+    n_embd: int = 512            # 词嵌入维度 (d_model)
+    n_heads: int = 8             # 注意力头数
+    n_layer: int = 6             # Encoder/Decoder 的层数
+    dim: int = 2048              # 前馈网络中间层维度 (通常为 4 * n_embd)
+    dropout: float = 0.1         # Dropout 比率
+
 
 # ------------------- 1. 注意力机制核心函数 -------------------
 def attention(query, key, value, mask=None, dropout=None):
@@ -111,44 +125,34 @@ class LayerNorm(nn.Module):
 
 # ------------------- 5. 位置编码模块 -------------------
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
+    '''正弦位置编码模块'''
+    def __init__(self, args: ModelArgs):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
+        self.dropout = nn.Dropout(args.dropout)
+        
+        # 创建位置编码矩阵: (1, block_size, n_embd)
+        pe = torch.zeros(args.block_size, args.n_embd)
+        position = torch.arange(0, args.block_size).unsqueeze(1).float()
         
         # 计算分母中的 10000^(2i/d_model)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, args.n_embd, 2).float() * 
+            -(math.log(10000.0) / args.n_embd)
+        )
         
-        # 计算正弦和余弦
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        pe[:, 0::2] = torch.sin(position * div_term) # 偶数维度
+        pe[:, 1::2] = torch.cos(position * div_term) # 奇数维度
         
-        # 增加 batch 维度，并注册为 buffer（不参与训练）
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        # 注册为 buffer，不参与训练但会随模型移动 (to device)
+        self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x):
-        # x: (batch_size, seq_len, d_model)
-        return x + self.pe[:, :x.size(1)].requires_grad_(False)
+        # x: (batch_size, seq_len, n_embd)
+        x = x + self.pe[:, :x.size(1)].requires_grad_(False)
+        return self.dropout(x)
 
 
-# ------------------- 6. Encoder Layer -------------------
-class EncoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
-        super().__init__()
-        self.norm1 = LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, dropout, is_causal=False)
-        self.norm2 = LayerNorm(d_model)
-        self.ff = FeedForward(d_model, d_ff, dropout)
-
-    def forward(self, x):
-        # Pre-Norm 结构
-        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        return x
-
-# 代码接上一节，需导入之前定义的 MultiHeadAttention, FeedForward, LayerNorm
-
+# ------------------- 6. Encoder 模块 -------------------
 class EncoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -165,6 +169,7 @@ class EncoderLayer(nn.Module):
         x = x + self.ff(self.norm2(x))
         return x
 
+
 class Encoder(nn.Module):
     def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -178,7 +183,9 @@ class Encoder(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.norm(x)
-    
+
+
+# ------------------- 7. Decoder 模块 -------------------
 class DecoderLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -204,6 +211,7 @@ class DecoderLayer(nn.Module):
         x = x + self.ff(self.norm3(x))
         return x
 
+
 class Decoder(nn.Module):
     def __init__(self, n_layers, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
@@ -218,6 +226,64 @@ class Decoder(nn.Module):
             x = layer(x, enc_out)
         return self.norm(x)
 
+
+# ------------------- 8. 完整的 Transformer 模型 -------------------
+class Transformer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        
+        # 1. 输入处理层
+        self.tok_emb = nn.Embedding(args.vocab_size, args.n_embd)
+        self.pos_enc = PositionalEncoding(args)
+        self.dropout = nn.Dropout(args.dropout)
+        
+        # 2. 核心架构
+        self.encoder = Encoder(args.n_layer, args.n_embd, args.n_heads, args.dim, args.dropout)
+        self.decoder = Decoder(args.n_layer, args.n_embd, args.n_heads, args.dim, args.dropout)
+        
+        # 3. 输出层 (将解码器输出映射回词表大小，用于预测下一个词)
+        self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
+
+        # 4. 权重初始化
+        self.apply(self._init_weights)
+        print(f"模型参数量: {self.get_num_params()/1e6:.2f} M")
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def get_num_params(self, non_embedding=False):
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.tok_emb.weight.numel()
+        return n_params
+
+    def forward(self, src_idx, tgt_idx):
+        """
+        Args:
+            src_idx: 源序列索引 (batch_size, src_seq_len)
+            tgt_idx: 目标序列索引 (batch_size, tgt_seq_len)
+        Returns:
+            logits: 预测结果 (batch_size, tgt_seq_len, vocab_size)
+        """
+        # ---- 编码阶段 (Encoder) ----
+        src_emb = self.dropout(self.pos_enc(self.tok_emb(src_idx)))
+        enc_out = self.encoder(src_emb) # (B, src_len, d_model)
+        
+        # ---- 解码阶段 (Decoder) ----
+        tgt_emb = self.dropout(self.pos_enc(self.tok_emb(tgt_idx)))
+        dec_out = self.decoder(tgt_emb, enc_out) # (B, tgt_len, d_model)
+        
+        # ---- 输出预测 ----
+        logits = self.lm_head(dec_out) # (B, tgt_len, vocab_size)
+        return logits
+
+
 # ------------------- 简单测试 -------------------
 if __name__ == "__main__":
     print("===== 测试 Transformer 核心组件 =====")
@@ -227,6 +293,7 @@ if __name__ == "__main__":
     seq_len = 10
     d_model = 512
     n_heads = 8
+    d_ff = 2048
     
     # 创建随机输入
     x = torch.randn(batch_size, seq_len, d_model)
@@ -241,8 +308,9 @@ if __name__ == "__main__":
     out_dec = mha_dec(x, x, x)
     print(f"Decoder MHA 输出形状: {out_dec.shape}") # 预期: [2, 10, 512]
     
-    # 测试位置编码
-    pe = PositionalEncoding(d_model)
+    # 测试位置编码（需要先创建一个 ModelArgs 对象）
+    args_for_test = ModelArgs(n_embd=d_model, block_size=seq_len)
+    pe = PositionalEncoding(args_for_test)
     out_pe = pe(x)
     print(f"位置编码后形状: {out_pe.shape}") # 预期: [2, 10, 512]
 
@@ -280,3 +348,38 @@ if __name__ == "__main__":
     print(f"Decoder 输入形状: {tgt.shape}")
     print(f"Decoder 输出形状: {dec_output.shape}") # 预期: [2, 8, 512]
     print("\nEncoder-Decoder 结构测试通过！")
+
+    print("\n===== 测试完整的 Transformer 模型 =====")
+    # 1. 定义超参数
+    args = ModelArgs(
+        vocab_size=1000,
+        block_size=20,
+        n_embd=512,
+        n_heads=8,
+        n_layer=3,
+        dim=2048,
+        dropout=0.1
+    )
+    
+    # 2. 实例化模型
+    model = Transformer(args)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    # 3. 构造模拟数据
+    batch_size = 2
+    src_seq_len = 10
+    tgt_seq_len = 8
+    
+    # 随机生成一些词索引
+    dummy_src = torch.randint(0, args.vocab_size, (batch_size, src_seq_len)).to(device)
+    dummy_tgt = torch.randint(0, args.vocab_size, (batch_size, tgt_seq_len)).to(device)
+    
+    # 4. 前向传播
+    logits = model(dummy_src, dummy_tgt)
+    
+    print(f"输入源序列形状: {dummy_src.shape}")
+    print(f"输入目标序列形状: {dummy_tgt.shape}")
+    print(f"输出 logits 形状: {logits.shape}") # 预期: (2, 8, 1000)
+    
+    print("\n🎉 完整的 Transformer 模型测试通过！")
